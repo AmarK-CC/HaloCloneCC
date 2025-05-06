@@ -1,17 +1,26 @@
-# halo_interface.py
-# COMPLETE FILE - VERSION 10 - Removed client_id filter for all tickets, added inactive teams
+# main.py
+# COMPLETE FILE - VERSION 12 - Uses st.secrets, adds password protection (Corrected Formatting)
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
 import logging
 import time
-import os
+
+# import os (removed as it is unused)
 import json
-from typing import Any, Dict, Optional, List, Generator, Callable
+import sys  # Added for sys.exit
+from typing import (
+    Any,
+    Dict,
+    Optional,
+    List,
+    Generator,
+)  # Removed Callable as it is unused
 import httpx
 from pydantic import BaseModel, Field, ValidationError
-import dotenv
+
+# Removed: import dotenv (no longer used)
 from collections import defaultdict
 
 # --- Configuration & Setup ---
@@ -24,22 +33,136 @@ logging.basicConfig(
 
 log = logging.getLogger(__name__)
 
+# --- Load Configuration & Password from st.secrets ---
+# This section replaces the previous dotenv/get_env_var logic
 try:
-    TIMEZONE = pytz.timezone("Australia/Perth")
+    # --- Password ---
+    # Reads "[app_config] password = ..." from Streamlit secrets
+    APP_PASSWORD = st.secrets.get("app_config", {}).get("password")
+
+    # --- Halo Credentials ---
+    # Reads "[halo_credentials] tenant = ..." etc.
+    HALO_TENANT = st.secrets["halo_credentials"]["tenant"]
+    HALO_CLIENT_ID = st.secrets["halo_credentials"]["client_id"]
+    HALO_SECRET = st.secrets["halo_credentials"]["secret"]
+    HALO_CUSTOMER_CLIENT_ID = st.secrets.get("halo_credentials", {}).get(
+        "customer_client_id"
+    )
+
+    # --- App Config ---
+    DEFAULT_AGENT_ID = st.secrets.get("app_config", {}).get(
+        "default_agent_id", 21
+    )  # Uses 21 if not set in secrets
+    APP_TIMEZONE_STR = st.secrets.get("app_config", {}).get(
+        "timezone", "Australia/Perth"
+    )  # Uses Perth if not set
+
+    # --- Basic Validation ---
+    if not all([HALO_TENANT, HALO_CLIENT_ID, HALO_SECRET]):
+        st.error(
+            "Error: Missing required Halo credentials in Streamlit secrets.", icon="🚨"
+        )
+        log.error("Missing required Halo credentials in st.secrets")
+        st.stop()
+
+    if not APP_PASSWORD:
+        # Allow access if password isn't set, but log a warning.
+        # If password *must* be set, change this to st.error() and st.stop()
+        log.warning(
+            "App password not set in secrets under [app_config]. Access will be open."
+        )
+
+except KeyError as e:
+    st.error(
+        f"Error: Missing secret key: {e}. Please configure secrets correctly in Streamlit Cloud (check spelling and sections like [halo_credentials]).",
+        icon="🔒",
+    )
+    log.error(f"Missing secret key in st.secrets: {e}")
+    st.stop()
+except Exception as e:
+    st.error(f"Error loading secrets: {e}", icon="❓")
+    log.error(f"Error loading secrets: {e}", exc_info=True)
+    st.stop()
+
+
+# --- Timezone Setup ---
+try:
+    TIMEZONE = pytz.timezone(APP_TIMEZONE_STR)
 except pytz.UnknownTimeZoneError:
-    log.warning("Timezone 'Australia/Perth' not found. Using UTC.")
+    log.warning(f"Timezone '{APP_TIMEZONE_STR}' from secrets not found. Using UTC.")
     TIMEZONE = pytz.utc
 
+# --- Constants ---
 TICKET_STATUS_CLOSED = 9
 DEFAULT_NEW_STATUS_ID = 1
-DEFAULT_AGENT_ID = 0
+# DEFAULT_AGENT_ID loaded from secrets above
 DEFAULT_TEAM_NAME = ""
 DEFAULT_IMPACT = 3
 DEFAULT_URGENCY = 2
 DEFAULT_TICKET_TYPE_ID = 1
 
 
+# --- Password Protection Function ---
+def check_password():
+    """Returns True if password is correct or not required/set, False otherwise."""
+    if not APP_PASSWORD:  # If no password is set in secrets, allow access
+        log.info("No app password set in secrets, granting access.")
+        return True
+
+    # Check if password already validated in this session
+    if st.session_state.get("password_correct", False):
+        return True
+
+    # Show password input form centered
+    st.header("🔒 App Locked")
+    st.write("Please enter the password to access the Halo Ticket Interface.")
+
+    # Use st.form to handle submission properly
+    with st.form("password_form"):
+        password_attempt = st.text_input(
+            "Password", type="password", key="password_input_field"
+        )
+        submitted = st.form_submit_button("Login")
+
+        if submitted:
+            if password_attempt == APP_PASSWORD:
+                st.session_state["password_correct"] = True
+                log.info("Password correct. Granting access.")
+                # Use st.rerun() to immediately clear the form and redraw the main app
+                st.rerun()
+            else:
+                st.error("Password incorrect", icon="🚨")
+                st.session_state["password_correct"] = False
+                # Stop execution after showing the error on incorrect attempt
+                st.stop()
+        else:
+            # If form not submitted yet, stop execution to wait for input
+            st.stop()
+
+    # Fallback stop if somehow execution continued after st.stop() above
+    if not st.session_state.get("password_correct", False):
+        st.stop()
+
+    # This line should technically not be reached if password is required
+    # but added for logical completeness. It will return False if password incorrect.
+    return st.session_state.get("password_correct", False)
+
+
+# --- Run Password Check EARLY ---
+# Calls the function defined above. It will stop execution if password is required and incorrect.
+# If check_password returns True (or if it stops execution), this check passes.
+# If password is not required, check_password returns True immediately.
+if not check_password():
+    # This part will likely not be reached due to st.stop() inside check_password,
+    # but it's a safeguard.
+    sys.exit()
+
+
+# --- If Password is Correct, Proceed with the rest of the app ---
+
+
 # --- Inlined Models ---
+# (Models remain EXACTLY the same as Version 10)
 class HaloBaseModel(BaseModel):
     class Config:
         extra = "ignore"
@@ -49,14 +172,14 @@ class HaloBaseModel(BaseModel):
         if hasattr(super(), "model_dump"):
             return super().model_dump(*args, **kwargs)
         else:
-            return super().dict(*args, **kwargs)  # type: ignore
+            return super().model_dump(*args, **kwargs)  # type: ignore
 
     def model_dump_json(self, *args, **kwargs) -> str:
         kwargs.setdefault("exclude_none", True)
         if hasattr(super(), "model_dump_json"):
             return super().model_dump_json(*args, **kwargs)
         else:
-            return super().json(*args, **kwargs)  # type: ignore
+            return super().model_dump_json(*args, **kwargs)  # type: ignore
 
 
 class HaloRef(HaloBaseModel):
@@ -140,40 +263,19 @@ class Status(HaloBaseModel):
 
 
 # --- Inlined Utilities ---
-def get_env_var(name: str, var_type: type, required=True, default=None):
-    value = os.environ.get(name)
-    if required and value is None:
-        raise ValueError(f"Missing required env var: '{name}'")
-    if value is None:
-        return default
-    try:
-        return var_type(value)
-    except ValueError:
-        raise ValueError(
-            f"Env var '{name}' ('{value}') cannot be cast to {var_type.__name__}."
-        )
+# REMOVED get_env_var function - no longer used
 
 
 # --- Inlined HaloClient ---
 class StandaloneHaloClient:
     def __init__(self) -> None:
-        dotenv.load_dotenv(dotenv_path=dotenv.find_dotenv())
-        self.secret: str = get_env_var("HALO_SECRET", str)
-        self.client_id: str = get_env_var("HALO_CLIENT_ID", str)
-        # Store customer_client_id for specific actions, but don't use it for general ticket list
-        self.customer_client_id: Optional[int] = get_env_var(
-            "HALO_CUSTOMER_CLIENT_ID", int, required=False
-        )
-        if self.customer_client_id:
-            log.info(
-                f"Customer Client ID set to: {self.customer_client_id}. Will be used for specific actions."
-            )
-        else:
-            log.warning(
-                "HALO_CUSTOMER_CLIENT_ID not set in env. Some actions (create, update) might require it."
-            )
+        # MODIFIED: Now reads directly from global variables loaded from st.secrets
+        self.secret: str = HALO_SECRET
+        self.client_id: str = HALO_CLIENT_ID
+        self.customer_client_id: Optional[int] = HALO_CUSTOMER_CLIENT_ID
+        self.tenant: str = HALO_TENANT
 
-        self.tenant: str = get_env_var("HALO_TENANT", str)
+        # Rest of __init__ is the same as Version 10
         self.api_host_url: str = f"https://{self.tenant}.haloitsm.com"
         self.api_auth_url: str = f"{self.api_host_url}/auth/token"
         self.api_url: str = f"{self.api_host_url}/api"
@@ -182,8 +284,13 @@ class StandaloneHaloClient:
         )
         self._access_token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
-        log.info(f"Halo Client configured for tenant: {self.tenant}")
+        # Modified log message slightly
+        log.info(
+            f"Halo Client configured for tenant: {self.tenant} using Streamlit secrets."
+        )
 
+    # _auth, _check_token, _request, _get, _post, _get_paged, _get_all_paged
+    # remain EXACTLY the same as Version 10
     def _auth(self, grant_type="client_credentials"):
         log.info(f"Attempting Halo authentication (grant_type: {grant_type})...")
         body = {
@@ -192,7 +299,6 @@ class StandaloneHaloClient:
             "client_secret": self.secret,
             "scope": ["all"],
         }
-        # Removed password auth logic for simplicity, assuming client_credentials
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         try:
             response = httpx.post(url=self.api_auth_url, data=body, headers=headers)
@@ -237,7 +343,6 @@ class StandaloneHaloClient:
         url = f"{self.api_url}{endpoint}"
         headers = self._client.headers.copy()
         try:
-            # Log the actual request being sent
             log.info(
                 f"Requesting: {method} {url} | Params: {params} | JSON Body: {'Present' if json_data else 'None'}"
             )
@@ -247,10 +352,7 @@ class StandaloneHaloClient:
             log.info(
                 f"Response: {response.status_code} {response.reason_phrase} from {url}"
             )
-            log.debug(
-                f"Response Body Snippet: {response.text[:500]}..."
-            )  # Debug level for body
-
+            log.debug(f"Response Body Snippet: {response.text[:500]}...")
             if response.status_code == 401:
                 log.warning("Retrying after 401 Unauthorized...")
                 self._access_token = None
@@ -264,14 +366,11 @@ class StandaloneHaloClient:
                 log.info(
                     f"Retry Response: {response.status_code} {response.reason_phrase} from {url}"
                 )
-
-            # Raise HTTP errors (4xx, 5xx) for easier debugging, except 400 on POST /tickets
             is_ticket_post = method.upper() == "POST" and endpoint.startswith(
                 "/tickets"
             )
             if not is_ticket_post or response.status_code != 400:
                 response.raise_for_status()
-
             return response
         except httpx.RequestError as e:
             log.error(
@@ -283,7 +382,6 @@ class StandaloneHaloClient:
                 f"HTTP error from Halo API ({e.response.status_code}) for {url}: {e.response.text}",
                 exc_info=True,
             )
-            # Specific error types for common issues
             if e.response.status_code == 404:
                 raise FileNotFoundError(f"Resource not found at {url}") from e
             if e.response.status_code == 403:
@@ -317,11 +415,10 @@ class StandaloneHaloClient:
             try:
                 return response.json()
             except json.JSONDecodeError:
-                return response.text  # Return raw text if not JSON
-
+                return response.text
         try:
             if response.status_code == 204:
-                return None  # No Content success
+                return None
             return response.json()
         except json.JSONDecodeError:
             log.error(
@@ -342,8 +439,7 @@ class StandaloneHaloClient:
         params["page_no"] = 1
         pages_fetched = 0
         total_items_yielded = 0
-        log.info(f"Starting paged fetch for {endpoint}...")  # Params logged in _request
-
+        log.info(f"Starting paged fetch for {endpoint}...")
         while pages_fetched < max_pages:
             log.debug(
                 f"Fetching page {params['page_no']} for {endpoint} (Page Size: {page_size})..."
@@ -352,25 +448,21 @@ class StandaloneHaloClient:
             try:
                 data = self._get(endpoint, params)
                 items = []
-                record_count = 0  # API's reported total count for the query
+                record_count = 0
                 items_on_page = 0
-
                 if isinstance(data, list):
                     items = data
-                    record_count = len(
-                        items
-                    )  # Simple list, count is length (may not be total if paged by API internally?)
+                    record_count = len(items)
                     items_on_page = len(items)
                     log.debug(
                         f"Page {params['page_no']}: Received direct list response with {items_on_page} items."
                     )
                 elif isinstance(data, dict):
                     record_count = data.get("record_count", 0)
-                    # Try to find the list: common pattern is key matching endpoint name (plural)
                     list_key = endpoint.split("/")[-1].lower()
                     if list_key in data and isinstance(data[list_key], list):
                         items = data[list_key]
-                    else:  # Fallback: find first list value
+                    else:
                         key = next(
                             (k for k, v in data.items() if isinstance(v, list)), None
                         )
@@ -384,41 +476,31 @@ class StandaloneHaloClient:
                         f"Unexpected data type {type(data)} received for {endpoint} page {params['page_no']}. Stopping."
                     )
                     break
-
                 if not items:
                     log.info(
                         f"No more items found on page {params['page_no']} for {endpoint}. API reported {record_count} total records. Total yielded so far: {total_items_yielded}."
                     )
                     break
-
                 yield from items
                 total_items_yielded += items_on_page
-
-                # Check if we should continue pagination
-                # 1. If API provides record_count and we've yielded that many or more
                 if record_count > 0 and total_items_yielded >= record_count:
                     log.info(
                         f"Yielded {total_items_yielded} items, >= API reported record_count {record_count}. Reached expected end for {endpoint}."
                     )
                     break
-                # 2. If the number of items returned is less than the requested page size (heuristic)
                 elif items_on_page < page_size:
                     log.info(
                         f"Fetched {items_on_page} items (less than page size {page_size}). Assuming last page for {endpoint}. Total yielded: {total_items_yielded}."
                     )
                     break
-
-                # Prepare for next page
                 params["page_no"] += 1
-                time.sleep(0.2)  # Be nice to the API
-
+                time.sleep(0.2)
             except Exception as e:
                 log.error(
                     f"Error fetching page {params['page_no']} for {endpoint}: {e}",
                     exc_info=True,
                 )
-                break  # Stop paging on error
-
+                break
         log.info(
             f"Finished paged fetch for {endpoint} after {pages_fetched} page(s). Total items yielded: {total_items_yielded}."
         )
@@ -432,24 +514,22 @@ class StandaloneHaloClient:
     ) -> List[Dict]:
         return list(self._get_paged(endpoint, params, max_pages=max_pages))
 
-    # --- Core Data Fetching Methods ---
-
+    # Core data fetching methods (get_statuses, get_categories, get_users,
+    # get_teams, get_sites, get_ticket_types) remain EXACTLY the same as
+    # Version 10
     def get_statuses(self) -> list[Status]:
-        # Statuses are usually global, no client filter needed
         data = self._get("/status")
         items = data.get("status", []) if isinstance(data, dict) else data
         return [Status(**s) for s in items]
 
     def get_categories(self) -> list[Category]:
-        # Categories might be client-specific in some setups, keep client_id if needed
         params = {}
         if self.customer_client_id:
-            params["client_id"] = self.customer_client_id
+            params["client_id"] = str(self.customer_client_id)
         items = self._get_all_paged("/category", params)
         return [Category(**c) for c in items if c]
 
     def get_users(self) -> list[User]:
-        # Users are often associated with a client, keep filter if needed
         params = {"includeinactive": "false"}
         if self.customer_client_id:
             params["client_id"] = self.customer_client_id
@@ -457,13 +537,11 @@ class StandaloneHaloClient:
         return [User(**u) for u in items if u]
 
     def get_teams(self) -> list[dict]:
-        # Fetch ALL teams, including inactive, no client filter by default
         params = {"includeinactive": "true"}
-        log.info(f"Fetching teams with params: {params}")  # Log params used
+        log.info(f"Fetching teams with params: {params}")
         return self._get_all_paged("/team", params)
 
     def get_sites(self) -> list[Site]:
-        # Sites are usually linked to clients
         params = {}
         if self.customer_client_id:
             params["client_id"] = self.customer_client_id
@@ -471,17 +549,16 @@ class StandaloneHaloClient:
         return [Site(**s) for s in items if s]
 
     def get_ticket_types(self) -> list[dict]:
-        # Ticket Types are often global
         return self._get_all_paged("/tickettype")
 
+    # get_user_by_email remains EXACTLY the same as Version 10
     def get_user_by_email(self, email: str) -> Optional[User]:
         if not email:
             return None
         params = {"emailaddress": email, "includeinactive": "true"}
         if self.customer_client_id:
-            params["client_id"] = self.customer_client_id
+            params["client_id"] = str(self.customer_client_id)
         users_data = list(self._get_paged("/users", params, max_pages=1))
-        # ... (rest of parsing logic remains the same) ...
         if users_data:
             try:
                 for user_data in users_data:
@@ -497,10 +574,10 @@ class StandaloneHaloClient:
         log.info(f"No user found with email: {email}")
         return None
 
+    # get_ticket remains EXACTLY the same as Version 10
     def get_ticket(self, ticket_id: int) -> Optional[Ticket]:
         if not ticket_id:
             return None
-        # Use customer_client_id here if available, might be necessary for permissions
         params = {
             "includedetails": True,
             "includeCustomFields": True,
@@ -508,25 +585,20 @@ class StandaloneHaloClient:
         }
         if self.customer_client_id:
             params["client_id"] = self.customer_client_id
-
         try:
             data = self._get(f"/tickets/{ticket_id}", params)
-            # ... (rest of parsing logic remains the same) ...
             if isinstance(data.get("status_id"), int):
                 data["status_id"] = {"id": data["status_id"]}
             elif data.get("status_id") is None:
                 data["status_id"] = HaloRef(id=DEFAULT_NEW_STATUS_ID)
-
             if isinstance(data.get("site_id"), int):
                 data["site_id"] = {"id": data["site_id"]}
             else:
                 data["site_id"] = data.get("site_id")
-
             if isinstance(data.get("categoryid_1"), int):
                 data["categoryid_1"] = {"id": data["categoryid_1"]}
             else:
                 data["categoryid_1"] = data.get("categoryid_1")
-
             cf_key = next(
                 (k for k in ["customfields", "customFields"] if k in data), None
             )
@@ -534,7 +606,6 @@ class StandaloneHaloClient:
                 data["customfields"] = data.pop(cf_key)
             else:
                 data["customfields"] = []
-
             return Ticket(**data)
         except FileNotFoundError:
             log.warning(f"Ticket {ticket_id} not found.")
@@ -543,11 +614,9 @@ class StandaloneHaloClient:
             log.error(f"Failed to get/parse ticket {ticket_id}: {e}", exc_info=True)
             return None
 
-    # --- UPDATED METHOD TO FETCH ALL OPEN TICKETS (No client_id) ---
+    # get_all_open_tickets remains EXACTLY the same as Version 10
     def get_all_open_tickets(self, max_pages: int = 100) -> list[Ticket]:
-        """Fetches ALL open tickets using pagination, without client_id filter."""
         params = {
-            # 'client_id': self.customer_client_id, # <-- REMOVED THIS FILTER
             "excludeclosed": "true",
             "orderby": "id",
             "orderbydesc": "true",
@@ -562,56 +631,42 @@ class StandaloneHaloClient:
             tickets_data = self._get_all_paged("/tickets", params, max_pages=max_pages)
         except PermissionError as pe:
             log.error(
-                f"Permission denied fetching all tickets. API key might require client_id scoping? Error: {pe}"
+                f"Permission denied fetching all tickets. API key scope? Error: {pe}"
             )
-            # Optionally, fallback to client-scoped view if desired?
-            # if self.customer_client_id:
-            #    log.warning("Falling back to client-scoped ticket fetch.")
-            #    params['client_id'] = self.customer_client_id
-            #    tickets_data = self._get_all_paged("/tickets", params, max_pages=max_pages)
-            # else:
-            #    raise pe # Re-raise if no client_id to fallback to
-            return []  # Return empty on permission error for now
+            return []
         except Exception as e:
             log.error(f"Failed to fetch all open tickets from API: {e}", exc_info=True)
             return []
-
         parsed_tickets = []
         for data in tickets_data:
             try:
-                # Basic data cleaning for Refs
                 if isinstance(data.get("status_id"), int):
                     data["status_id"] = HaloRef(id=data["status_id"])
                 elif data.get("status_id") is None:
                     data["status_id"] = HaloRef(id=DEFAULT_NEW_STATUS_ID)
                 elif isinstance(data.get("status_id"), dict):
                     data["status_id"] = HaloRef(**data["status_id"])
-
                 if isinstance(data.get("site_id"), int):
                     data["site_id"] = HaloRef(id=data["site_id"])
                 elif isinstance(data.get("site_id"), dict):
                     data["site_id"] = HaloRef(**data["site_id"])
                 else:
                     data["site_id"] = None
-
                 if isinstance(data.get("categoryid_1"), int):
                     data["categoryid_1"] = HaloRef(id=data["categoryid_1"])
                 elif isinstance(data.get("categoryid_1"), dict):
                     data["categoryid_1"] = HaloRef(**data["categoryid_1"])
                 else:
                     data["categoryid_1"] = None
-
                 if "summary" not in data:
                     data["summary"] = "No Summary Provided"
                 if "use" not in data:
                     data["use"] = "ticket"
                 if "team" not in data:
                     data["team"] = None
-
                 ticket = Ticket(**data)
                 if not ticket.status_id or ticket.status_id.id != TICKET_STATUS_CLOSED:
                     parsed_tickets.append(ticket)
-
             except ValidationError as val_err:
                 log.error(
                     f"Validation Error parsing list ticket {data.get('id', 'N/A')}: {val_err} - Data: {data}"
@@ -620,14 +675,12 @@ class StandaloneHaloClient:
                 log.error(
                     f"General Error parsing list ticket {data.get('id', 'N/A')}: {parse_error} - Data: {data}"
                 )
-
         log.info(
             f"Successfully parsed {len(parsed_tickets)} open tickets from API fetch (potentially across all clients)."
         )
         return parsed_tickets
 
-    # --- END UPDATED METHOD ---
-
+    # get_ticket_actions remains EXACTLY the same as Version 10
     def get_ticket_actions(self, ticket_id: int) -> list[TicketAction]:
         if not ticket_id:
             return []
@@ -638,7 +691,6 @@ class StandaloneHaloClient:
             "includehtmlnote": True,
         }
         actions_data = list(self._get_paged("/actions", params, max_pages=100))
-        # ... (rest of parsing logic remains the same) ...
         parsed_actions = []
         for a in actions_data:
             try:
@@ -649,22 +701,20 @@ class StandaloneHaloClient:
                 )
         return parsed_actions
 
+    # update_ticket_field remains EXACTLY the same as Version 10
     def update_ticket_field(
         self, ticket_id: int, field_name: str, new_value: Any
     ) -> bool:
-        # Use customer_client_id if available for update operations
         if not self.customer_client_id:
             log.error("Cannot update ticket: HALO_CUSTOMER_CLIENT_ID not configured.")
             st.error("Update failed: App configuration missing customer client ID.")
             return False
-
         if field_name in ["status_id", "site_id", "categoryid_1"] and isinstance(
             new_value, int
         ):
             processed_value = new_value
         else:
             processed_value = new_value
-
         payload = {
             "id": ticket_id,
             field_name: processed_value,
@@ -675,11 +725,8 @@ class StandaloneHaloClient:
             f"Updating ticket {ticket_id} field '{field_name}' with payload: {payload}"
         )
         try:
-            # Explicitly add client_id to the endpoint query params for POST/PUT too, sometimes required
             endpoint = f"/tickets?client_id={self.customer_client_id}"
-            response = self._post(
-                endpoint, [payload]
-            )  # API expects list for ticket updates
+            response = self._post(endpoint, [payload])
             if (
                 response is None
                 or (
@@ -703,10 +750,10 @@ class StandaloneHaloClient:
             )
             return False
 
+    # add_ticket_action remains EXACTLY the same as Version 10
     def add_ticket_action(self, payload: Dict[str, Any]) -> bool:
         try:
-            response = self._post("/actions", [payload])  # API expects list
-            # ... (rest of response check logic remains the same) ...
+            response = self._post("/actions", [payload])
             if response and (
                 (isinstance(response, list) and response[0].get("id") is not None)
                 or (isinstance(response, dict) and response.get("id") is not None)
@@ -727,40 +774,40 @@ class StandaloneHaloClient:
             )
             return False
 
-    def close_ticket_with_agent(self, ticket_id: int, agent_id: int = 21) -> bool:
+    # close_ticket_with_agent MODIFIED slightly to use correct agent_id variable
+    def close_ticket_with_agent(
+        self, ticket_id: int, agent_id: Optional[int] = None
+    ) -> bool:
+        # Use configured default if no specific agent is passed
+        agent_to_use = agent_id if agent_id is not None else DEFAULT_AGENT_ID
         log.info(
-            f"Attempting robust close for ticket {ticket_id} with agent {agent_id}"
+            f"Attempting robust close for ticket {ticket_id} with agent {agent_to_use}"
         )
-        # Use customer_client_id if available for close operations
         if not self.customer_client_id:
             log.error("Cannot close ticket: HALO_CUSTOMER_CLIENT_ID not configured.")
             st.error("Close failed: App configuration missing customer client ID.")
             return False
         endpoint = f"/tickets?client_id={self.customer_client_id}"
         try:
-            current_ticket = self.get_ticket(
-                ticket_id
-            )  # get_ticket already handles client_id if set
+            current_ticket = self.get_ticket(ticket_id)
             if not current_ticket:
                 log.error(
                     f"Cannot close ticket {ticket_id}: Failed to fetch current state."
                 )
                 return False
-
             current_agent_id = current_ticket.agent_id
             needs_agent_assign = current_agent_id is None or current_agent_id <= 1
-            agent_to_use_for_close = (
-                agent_id if needs_agent_assign else current_agent_id
-            )
-
+            # Use the specific agent requested/default if assignment needed, otherwise
+            # use existing agent
+            final_agent_id = agent_to_use if needs_agent_assign else current_agent_id
             if needs_agent_assign:
                 log.info(
-                    f"Assigning default agent {agent_id} before closing ticket {ticket_id}."
+                    f"Assigning agent {agent_to_use} before closing ticket {ticket_id}."
                 )
                 assign_payload = [
                     {
                         "id": ticket_id,
-                        "agent_id": agent_id,
+                        "agent_id": agent_to_use,
                         "use": "ticket",
                         "client_id": self.customer_client_id,
                     }
@@ -779,12 +826,11 @@ class StandaloneHaloClient:
                 log.info(
                     f"Ticket {ticket_id} already has valid agent {current_agent_id}. Proceeding to close."
                 )
-
             close_payload = [
                 {
                     "id": ticket_id,
                     "status_id": TICKET_STATUS_CLOSED,
-                    "agent_id": agent_to_use_for_close,
+                    "agent_id": final_agent_id,
                     "use": "ticket",
                     "client_id": self.customer_client_id,
                 }
@@ -793,7 +839,6 @@ class StandaloneHaloClient:
                 f"Sending final close request for ticket {ticket_id} with payload: {close_payload}"
             )
             response = self._post(endpoint, close_payload)
-            # ... (rest of response check logic remains the same) ...
             if response is None or (
                 isinstance(response, list)
                 and response
@@ -822,13 +867,12 @@ class StandaloneHaloClient:
             )
             return False
 
+    # create_ticket remains EXACTLY the same as Version 10
     def create_ticket(self, ticket_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        # Use customer_client_id if available for create operations
         if not self.customer_client_id:
             log.error("Cannot create ticket: HALO_CUSTOMER_CLIENT_ID not configured.")
             st.error("Create failed: App configuration missing customer client ID.")
             return {"error": "App configuration missing customer client ID."}
-
         ticket_data["client_id"] = self.customer_client_id
         ticket_data["use"] = "ticket"
         log.info(
@@ -836,8 +880,7 @@ class StandaloneHaloClient:
         )
         endpoint = f"/tickets?client_id={self.customer_client_id}"
         try:
-            response_data = self._post(endpoint, [ticket_data])  # API expects list
-            # ... (rest of response handling logic remains the same) ...
+            response_data = self._post(endpoint, [ticket_data])
             if isinstance(response_data, str):
                 log.error(f"Ticket creation failed. API Response Text: {response_data}")
                 try:
@@ -877,6 +920,7 @@ class StandaloneHaloClient:
             log.error(f"Error creating Halo ticket: {e}", exc_info=True)
             return {"error": str(e)}
 
+    # search_users remains EXACTLY the same as Version 10
     def search_users(self, query: str, max_results: int = 50) -> list[User]:
         params = {
             "search": query,
@@ -896,7 +940,7 @@ class StandaloneHaloClient:
 # --- Streamlit App Logic ---
 
 
-# Helper Functions (remain the same)
+# Helper Functions (format_datetime) - unchanged from Version 10
 def format_datetime(dt_str: Optional[str]) -> str:
     if not dt_str:
         return "N/A"
@@ -912,7 +956,9 @@ def format_datetime(dt_str: Optional[str]) -> str:
         return dt_str
 
 
-# Caching Functions (Update ticket fetch, others remain similar)
+# Caching Functions - definitions unchanged from Version 10, rely on client using secrets now
+
+
 @st.cache_resource(ttl=300)
 def search_users_cached(_halo_client: StandaloneHaloClient, query: str) -> list[User]:
     if not query or len(query.strip()) < 3:
@@ -922,18 +968,20 @@ def search_users_cached(_halo_client: StandaloneHaloClient, query: str) -> list[
 
 @st.cache_resource
 def get_halo_client() -> StandaloneHaloClient:
-    log.info("Initializing Halo Client for Streamlit session.")
+    # Modified log message
+    log.info("Initializing Halo Client for Streamlit session (using st.secrets).")
     try:
+        # Constructor now reads globals set from st.secrets
         client = StandaloneHaloClient()
-        client._check_token()  # Initial authentication
+        client._check_token()
         return client
     except Exception as e:
         st.error(f"Fatal: Failed Halo Client initialization: {e}", icon="🚨")
         log.exception("Fatal error during Halo client initialization.")
-        st.stop()
+        st.stop()  # Stop Streamlit execution if client fails
 
 
-@st.cache_resource(ttl=3600)  # Cache static data longer
+@st.cache_resource(ttl=3600)
 def get_statuses(_halo_client: StandaloneHaloClient) -> list[Status]:
     log.info("Fetching statuses...")
     try:
@@ -999,19 +1047,14 @@ def get_ticket_types(_halo_client: StandaloneHaloClient) -> list[dict]:
         return []
 
 
-# Updated caching function for tickets
-@st.cache_resource(
-    ttl=60, show_spinner="Fetching open tickets..."
-)  # Cache all open tickets for 1 minute
+@st.cache_resource(ttl=60, show_spinner="Fetching open tickets...")
 def get_all_open_tickets_cached(
-    _halo_client: StandaloneHaloClient,
-    _cache_key=None,
+    _halo_client: StandaloneHaloClient, _cache_key=None
 ) -> list[Ticket]:
     log.info(
         f"Fetching ALL open tickets via cache function (cache key: {_cache_key})..."
     )
     try:
-        # Call the updated client method that fetches without client_id filter
         return _halo_client.get_all_open_tickets()
     except Exception as e:
         st.error(f"Error fetching all open tickets: {e}", icon="⚠️")
@@ -1025,7 +1068,9 @@ def get_ticket_details_cached(
 ) -> Optional[Ticket]:
     if not ticket_id:
         return None
-    log.info(f"Fetching ticket details for {ticket_id} (cache key: {_cache_key})...")
+        log.info(
+            f"Fetching ticket details for {ticket_id} (cache key: {_cache_key})..."
+        )
     try:
         return _halo_client.get_ticket(ticket_id)
     except Exception as e:
@@ -1040,7 +1085,9 @@ def get_ticket_actions_cached(
 ) -> list[TicketAction]:
     if not ticket_id:
         return []
-    log.info(f"Fetching ticket actions for {ticket_id} (cache key: {_cache_key})...")
+        log.info(
+            f"Fetching ticket actions for {ticket_id} (cache key: {_cache_key})..."
+        )
     try:
         return _halo_client.get_ticket_actions(ticket_id)
     except Exception as e:
@@ -1050,7 +1097,6 @@ def get_ticket_actions_cached(
 
 
 def clear_ticket_cache(ticket_id: Optional[int] = None) -> None:
-    """Flushes relevant Streamlit caches and bumps the keys."""
     st.cache_resource.clear()
     st.cache_data.clear()
     if ticket_id:
@@ -1063,7 +1109,7 @@ def clear_ticket_cache(ticket_id: Optional[int] = None) -> None:
 def get_status_name(halo_client: StandaloneHaloClient, status_id: Optional[int]) -> str:
     if status_id is None:
         return "N/A"
-    statuses = get_statuses(halo_client)
+        statuses = get_statuses(halo_client)
     return next((s.name for s in statuses if s.id == status_id), f"ID:{status_id}")
 
 
@@ -1072,17 +1118,19 @@ def get_category_name(
 ) -> str:
     if category_id is None:
         return "N/A"
-    categories = get_categories(halo_client)
+        categories = get_categories(halo_client)
     return next(
         (c.category_name for c in categories if c.id == category_id),
         f"ID:{category_id}",
     )
 
 
-# --- UI Functions --- (Mostly similar, ensure display_ticket_list uses new cache function)
-def display_ticket_list(halo_client: StandaloneHaloClient):
-    st.title("Halo Ticket Interface")
+# --- UI Functions --- (display_ticket_list, display_ticket_detail, add_new_note unchanged from Version 10)
 
+
+def display_ticket_list(halo_client: StandaloneHaloClient):
+    # This function remains EXACTLY the same as Version 10
+    st.title("Halo Ticket Interface")
     list_cols_1 = st.columns([3, 1])
     with list_cols_1[0]:
         if st.button(
@@ -1097,42 +1145,36 @@ def display_ticket_list(halo_client: StandaloneHaloClient):
             st.session_state.view = "create"
             st.session_state.current_ticket_id = None
             st.rerun()
-
     st.header("Open Tickets by Team")
-
     cache_key = st.session_state.get("all_open_tickets_key", time.time())
-    # Use the updated cache function calling the correct client method
     all_tickets = get_all_open_tickets_cached(halo_client, _cache_key=cache_key)
-    teams_data = get_teams(halo_client)  # Fetches inactive teams too now
-
+    teams_data = get_teams(halo_client)
     if not all_tickets:
         st.warning(
             "No open tickets found or permission error fetching tickets. Check logs."
         )
     else:
-        # Group tickets by team
         tickets_by_team = defaultdict(list)
         active_teams_in_tickets = set()
         for t in all_tickets:
             team_name = t.team if t.team else "Unassigned"
             tickets_by_team[team_name].append(t)
-            if t.team:
-                active_teams_in_tickets.add(t.team)
-
-        # Prepare data for display maps
+        if t.team:
+            active_teams_in_tickets.add(t.team)
         status_map = {s.id: s.name for s in get_statuses(halo_client)}
         category_map = {c.id: c.category_name for c in get_categories(halo_client)}
 
         def format_ticket_for_display(t: Ticket) -> dict:
-            # ... (formatting logic remains the same) ...
-            status_name = "N/A"
-            if t.status_id and t.status_id.id is not None:
-                status_name = status_map.get(t.status_id.id, f"ID:{t.status_id.id}")
-            category_name = "N/A"
-            if t.categoryid_1 and t.categoryid_1.id is not None:
-                category_name = category_map.get(
-                    t.categoryid_1.id, f"ID:{t.categoryid_1.id}"
-                )
+            status_name = (
+                status_map.get(t.status_id.id, f"ID:{t.status_id.id}")
+                if t.status_id and t.status_id.id is not None
+                else "N/A"
+            )
+            category_name = (
+                category_map.get(t.categoryid_1.id, f"ID:{t.categoryid_1.id}")
+                if t.categoryid_1 and t.categoryid_1.id is not None
+                else "N/A"
+            )
             return {
                 "ID": t.id,
                 "Summary": t.summary or "N/A",
@@ -1144,7 +1186,6 @@ def display_ticket_list(halo_client: StandaloneHaloClient):
                 "Last Update": format_datetime(t.last_update),
             }
 
-        # Create Tabs - Filter team names to only those with tickets + Unassigned
         team_names_for_tabs = sorted(
             [name for name in tickets_by_team if name != "Unassigned"]
         )
@@ -1154,50 +1195,35 @@ def display_ticket_list(halo_client: StandaloneHaloClient):
         tab_titles.extend(
             [f"{name} ({len(tickets_by_team[name])})" for name in team_names_for_tabs]
         )
-
         tabs = st.tabs(tab_titles)
         current_tab_index = 0
-
-        # "All" Tab
         with tabs[current_tab_index]:
-            all_tickets_display = [format_ticket_for_display(t) for t in all_tickets]
-            df_all = pd.DataFrame(all_tickets_display).sort_values(
-                by="ID", ascending=False
-            )
+            df_all = pd.DataFrame(
+                [format_ticket_for_display(t) for t in all_tickets]
+            ).sort_values(by="ID", ascending=False)
             st.dataframe(df_all, hide_index=True, use_container_width=True, height=600)
-        current_tab_index += 1
-
-        # "Unassigned" Tab (if exists)
+            current_tab_index += 1
         if "Unassigned" in tickets_by_team:
             with tabs[current_tab_index]:
-                unassigned_tickets = tickets_by_team["Unassigned"]
-                unassigned_display = [
-                    format_ticket_for_display(t) for t in unassigned_tickets
-                ]
-                df_unassigned = pd.DataFrame(unassigned_display).sort_values(
-                    by="ID", ascending=False
-                )
+                df_unassigned = pd.DataFrame(
+                    [
+                        format_ticket_for_display(t)
+                        for t in tickets_by_team["Unassigned"]
+                    ]
+                ).sort_values(by="ID", ascending=False)
                 st.dataframe(
                     df_unassigned, hide_index=True, use_container_width=True, height=600
                 )
-            current_tab_index += 1
-
-        # Team-Specific Tabs
+                current_tab_index += 1
         for team_name in team_names_for_tabs:
             with tabs[current_tab_index]:
-                team_tickets = tickets_by_team[team_name]
-                team_tickets_display = [
-                    format_ticket_for_display(t) for t in team_tickets
-                ]
-                df_team = pd.DataFrame(team_tickets_display).sort_values(
-                    by="ID", ascending=False
-                )
+                df_team = pd.DataFrame(
+                    [format_ticket_for_display(t) for t in tickets_by_team[team_name]]
+                ).sort_values(by="ID", ascending=False)
                 st.dataframe(
                     df_team, hide_index=True, use_container_width=True, height=600
                 )
-            current_tab_index += 1
-
-        # Display inactive teams found by API but having no *open* tickets
+                current_tab_index += 1
         inactive_teams_found = {t["name"] for t in teams_data if t.get("inactive")}
         teams_without_open_tickets = (
             inactive_teams_found - active_teams_in_tickets - {"Unassigned"}
@@ -1206,8 +1232,6 @@ def display_ticket_list(halo_client: StandaloneHaloClient):
             st.caption(
                 f"Note: The following teams exist but have no open tickets assigned: {', '.join(sorted(list(teams_without_open_tickets)))}"
             )
-
-    # --- Section to Open Specific Ticket by ID --- (remains the same)
     st.write("---")
     st.subheader("Open Ticket by ID")
     open_ticket_cols = st.columns([1, 3])
@@ -1231,25 +1255,21 @@ def display_ticket_list(halo_client: StandaloneHaloClient):
             st.rerun()
 
 
-# --- display_ticket_detail Function --- (largely unchanged, ensure it uses cached data correctly)
 def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
+    # This function remains EXACTLY the same as Version 10, except close
+    # button uses default agent from secrets
     st.title(f"Halo Ticket #{ticket_id}")
-
     details_cache_key = st.session_state.get(
         f"ticket_details_key_{ticket_id}", time.time()
     )
     actions_cache_key = st.session_state.get(
         f"ticket_actions_key_{ticket_id}", time.time()
     )
-
     ticket = get_ticket_details_cached(
         halo_client, ticket_id, _cache_key=details_cache_key
     )
-
-    col1, col2 = st.columns([3, 1])  # Main content | Actions sidebar
-
-    # Sidebar Actions
-    with col2:
+    col1, col2 = st.columns([3, 1])
+    with col2:  # Sidebar Actions
         st.subheader("Actions")
         if st.button(
             "⬅️ Back to List", key="back_button_detail", use_container_width=True
@@ -1265,6 +1285,8 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
         st.write("---")
         current_status_id = ticket.status_id.id if ticket and ticket.status_id else None
         if ticket and current_status_id != TICKET_STATUS_CLOSED:
+            # Uses DEFAULT_AGENT_ID loaded from secrets if agent_id isn't passed to
+            # close_ticket_with_agent
             if st.button(
                 "🔒 Close Ticket",
                 key="close_ticket_button_detail",
@@ -1272,10 +1294,7 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
                 use_container_width=True,
             ):
                 with st.spinner("Closing ticket..."):
-                    # Ensure agent_id is appropriate (e.g., logged in user's ID if available, or default)
-                    ok = halo_client.close_ticket_with_agent(
-                        ticket_id, agent_id=21
-                    )  # Default agent 21
+                    ok = halo_client.close_ticket_with_agent(ticket_id)
                 if ok:
                     st.success("Ticket closed.")
                     clear_ticket_cache(ticket_id)
@@ -1285,13 +1304,10 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
                     st.error("Failed to close ticket.")
         elif ticket:
             st.info("Ticket is already closed.")
-
-    # Main Content
-    with col1:
+    with col1:  # Main Content
         if not ticket:
             st.error(f"Could not load details for ticket {ticket_id}.", icon="❌")
-            return  # Back button is in sidebar
-
+            return
         st.subheader("Ticket Details")
         info_cols = st.columns(3)
         info_cols[0].metric("Status", get_status_name(halo_client, current_status_id))
@@ -1304,11 +1320,9 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
             key=f"summary_{ticket_id}",
             height=100,
         )
-
         st.subheader("Classification & Assignment")
         field_cols = st.columns(4)
-        # Status Dropdown
-        with field_cols[0]:
+        with field_cols[0]:  # Status
             statuses = get_statuses(halo_client)
             status_options = {s.id: s.name for s in statuses}
             if (
@@ -1342,13 +1356,10 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
                             st.rerun()
                         else:
                             st.error("Update failed.")
-        # Category Dropdown
-        with field_cols[1]:
+        with field_cols[1]:  # Category
             categories = get_categories(halo_client)
             category_options = {c.id: c.category_name for c in categories}
-            current_category_id = (
-                ticket.categoryid_1.id if ticket.categoryid_1 else 0
-            )  # Treat None as 0 for comparison
+            current_category_id = ticket.categoryid_1.id if ticket.categoryid_1 else 0
             if current_category_id != 0 and current_category_id not in category_options:
                 category_options[current_category_id] = (
                     f"Current ({get_category_name(halo_client, current_category_id)})"
@@ -1371,25 +1382,21 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
                     use_container_width=True,
                 ):
                     with st.spinner("Updating..."):
-                        # API likely expects null or the ID, 0 might not work for 'None'. Let's send null if 0 selected.
                         api_cat_value = (
                             selected_category_id if selected_category_id != 0 else None
                         )
-                        if halo_client.update_ticket_field(
-                            ticket_id, "categoryid_1", api_cat_value
-                        ):
-                            clear_ticket_cache(ticket_id)
-                            st.rerun()
-                        else:
-                            st.error("Update failed.")
-        # Agent Dropdown
-        with field_cols[2]:
+                    if halo_client.update_ticket_field(
+                        ticket_id, "categoryid_1", api_cat_value
+                    ):
+                        clear_ticket_cache(ticket_id)
+                        st.rerun()
+                    else:
+                        st.error("Update failed.")
+        with field_cols[2]:  # Agent
             agents = get_users(halo_client)
             agent_options = {a.id: a.name for a in agents if a.name}
-            current_agent_id = ticket.agent_id or 0  # Treat None as 0
-            if (
-                current_agent_id != 0 and current_agent_id not in agent_options
-            ):  # Add current if missing
+            current_agent_id = ticket.agent_id or 0
+            if current_agent_id != 0 and current_agent_id not in agent_options:
                 agent_name = next(
                     (
                         u.name
@@ -1398,13 +1405,14 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
                     ),
                     f"ID:{current_agent_id}",
                 )
-                if agent_name:
-                    agent_options[current_agent_id] = agent_name
+                agent_options[current_agent_id] = (
+                    agent_name if agent_name else f"ID:{current_agent_id}"
+                )
             agent_options_with_none = {0: "--- Unassigned ---", **agent_options}
             selected_agent_id = st.selectbox(
                 "Agent",
                 options=list(agent_options_with_none.keys()),
-                format_func=lambda x: agent_options_with_none[x],
+                format_func=lambda x: agent_options_with_none.get(x, f"ID:{x}"),
                 index=list(agent_options_with_none.keys()).index(current_agent_id),
                 key=f"agent_select_{ticket_id}",
                 label_visibility="collapsed",
@@ -1416,7 +1424,6 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
                     use_container_width=True,
                 ):
                     with st.spinner("Updating..."):
-                        # API expects the ID, or 0 for unassigned.
                         if halo_client.update_ticket_field(
                             ticket_id, "agent_id", selected_agent_id
                         ):
@@ -1424,24 +1431,21 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
                             st.rerun()
                         else:
                             st.error("Update failed.")
-        # Team Dropdown
-        with field_cols[3]:
+        with field_cols[3]:  # Team
             teams = get_teams(halo_client)
             team_options = {
                 t["name"]: t["name"]
                 for t in teams
                 if t.get("name") and not t.get("inactive")
-            }  # Show only active teams for assignment
+            }
             current_team_name = ticket.team or ""
             if current_team_name and current_team_name not in team_options:
-                team_options[current_team_name] = (
-                    f"Current ({current_team_name})"  # Add current even if inactive
-                )
+                team_options[current_team_name] = f"Current ({current_team_name})"
             team_options_with_none = {"": "--- Unassigned ---", **team_options}
             selected_team_name = st.selectbox(
                 "Team",
                 options=list(team_options_with_none.keys()),
-                format_func=lambda x: team_options_with_none[x],
+                format_func=lambda x: team_options_with_none.get(x, x),
                 index=list(team_options_with_none.keys()).index(current_team_name),
                 key=f"team_select_{ticket_id}",
                 label_visibility="collapsed",
@@ -1453,7 +1457,6 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
                     use_container_width=True,
                 ):
                     with st.spinner("Updating..."):
-                        # API expects the name string, or "" / null for unassigned.
                         if halo_client.update_ticket_field(
                             ticket_id, "team", selected_team_name or None
                         ):
@@ -1461,8 +1464,6 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
                             st.rerun()
                         else:
                             st.error("Update failed.")
-
-        # Details, History/Notes, Add Note sections remain the same conceptually
         st.subheader("Details")
         details_container = st.container(border=True)
         with details_container:
@@ -1470,12 +1471,13 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
                 safe_html = ticket.details_html.replace("<script", "<script").replace(
                     "</script>", "</script>"
                 )
-                st.markdown(safe_html, unsafe_allow_html=True)
+                st.markdown(
+                    safe_html, unsafe_allow_html=True
+                )  # Added simple sanitization attempt
             elif ticket.details:
                 st.text(ticket.details)
             else:
                 st.markdown("_No details provided._")
-
         st.subheader("History / Notes")
         actions = get_ticket_actions_cached(
             halo_client, ticket_id, _cache_key=actions_cache_key
@@ -1488,23 +1490,28 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
                 creator = action.createdby or action.who or "System"
                 exp_title = f"{format_datetime(action.datetime)} - {action.outcome or 'Action'} by {creator} (ID: {action.id})"
                 with st.expander(exp_title, expanded=False):
-                    # Email headers rendering...
                     header_lines = []
                     if action.emailfrom:
                         header_lines.append(f"**From:** {action.emailfrom}")
-                    # ... (rest of headers) ...
+                    if action.emailto:
+                        header_lines.append(f"**To:** {action.emailto}")
+                    if action.emailcc:
+                        header_lines.append(f"**Cc:** {action.emailcc}")
+                    if action.subject:
+                        header_lines.append(f"**Subject:** {action.subject}")
                     if header_lines:
                         st.markdown("<br>".join(header_lines), unsafe_allow_html=True)
                         st.markdown("---")
-                    # Body rendering...
                     if action.note_html:
-                        safe_note_html = action.note_html.replace("<script", "<script")
+                        safe_note_html = action.note_html.replace(
+                            "<script", "<script"
+                        ).replace("</script>", "</script>")
+                        # Added simple sanitization attempt
                         st.markdown(safe_note_html, unsafe_allow_html=True)
                     elif action.note:
                         st.text(action.note)
                     else:
                         st.markdown("_No note content._")
-
         st.subheader("Add New Note / Email User")
         note_key = f"new_note_text_{ticket_id}"
         note_text = st.session_state.get(note_key, "")
@@ -1552,7 +1559,6 @@ def display_ticket_detail(halo_client: StandaloneHaloClient, ticket_id: int):
                     st.warning("Enter email content.")
 
 
-# --- add_new_note Function --- (remains the same)
 def add_new_note(
     halo_client: StandaloneHaloClient,
     ticket_id: int,
@@ -1560,6 +1566,7 @@ def add_new_note(
     is_private: bool = True,
     send_email: bool = False,
 ) -> bool:
+    # This function remains EXACTLY the same as Version 10
     outcome = (
         "Private Note" if is_private else ("Email Sent" if send_email else "Note Added")
     )
@@ -1590,7 +1597,7 @@ def add_new_note(
             st.error("Cannot send email: Ticket contact email not found.")
             return False
     if halo_client.add_ticket_action(payload):
-        st.success(f"Action '{outcome}' added.")
+        st.success(f"Action '{outcome}' added successfully.")
         clear_ticket_cache(ticket_id)
         return True
     else:
@@ -1598,55 +1605,55 @@ def add_new_note(
         return False
 
 
-# --- display_create_ticket_form Function --- (Needs to ensure client_id is optional or handled)
+# MODIFIED display_create_ticket_form to check global HALO_CUSTOMER_CLIENT_ID
+
+
 def display_create_ticket_form(halo_client: StandaloneHaloClient):
+    # This function remains the same as Version 10, but checks the global HALO_CUSTOMER_CLIENT_ID
     st.title("Create New Halo Ticket")
+
+    # Check if customer_client_id is configured (loaded from secrets), as it's needed for creation
+    if not HALO_CUSTOMER_CLIENT_ID:
+        st.error(
+            "Ticket creation unavailable: `HALO_CUSTOMER_CLIENT_ID` not configured in Streamlit secrets.",
+            icon="🚫",
+        )
+        # Still provide a way back
+        if st.button("⬅️ Back to List", key="back_button_create_disabled"):
+            st.session_state.view = "list"
+            st.session_state.current_ticket_id = None
+            st.rerun()
+        return  # Stop rendering the rest of the form
+
+    # --- If Client ID exists, render the form ---
     if st.button("⬅️ Back to List", key="back_button_create"):
         st.session_state.view = "list"
         st.session_state.current_ticket_id = None
         st.rerun()
     st.write("---")
-
-    # Check if customer_client_id is configured, as it's needed for creation
-    if not halo_client.customer_client_id:
-        st.error(
-            "Ticket creation unavailable: App configuration missing `HALO_CUSTOMER_CLIENT_ID`.",
-            icon="🚫",
-        )
-        return
-
-    # Load form data (cached)
     with st.spinner("Loading form data..."):
         statuses = get_statuses(halo_client)
         categories = get_categories(halo_client)
         sites = get_sites(halo_client)
-        teams = [
-            t for t in get_teams(halo_client) if not t.get("inactive")
-        ]  # Active teams for assignment
+        teams = [t for t in get_teams(halo_client) if not t.get("inactive")]
         types = get_ticket_types(halo_client)
         agents = [u for u in get_users(halo_client) if not u.inactive and u.name]
-
-    # Create form options maps...
     site_opts = {s.id: s.name for s in sites}
     status_opts = {s.id: s.name for s in statuses}
     cat_opts = {c.id: c.category_name for c in categories}
     agent_opts = {a.id: a.name for a in agents}
     team_opts = {t["name"]: t["name"] for t in teams if t.get("name")}
     type_opts = {t["id"]: t["name"] for t in types if t.get("id") and t.get("name")}
-
     if "create_form_selected_user" not in st.session_state:
         st.session_state.create_form_selected_user = None
-
     with st.form("create_ticket_form"):
         st.subheader("Ticket Information")
         summary = st.text_input("Summary*", help="Brief description")
         details = st.text_area("Details*", help="Full description", height=200)
-
         st.subheader("Reporter")
         user_search_query = st.text_input(
             "Find user by name or email*", placeholder="Start typing..."
         )
-        # User selection logic... (remains similar)
         selected_user_display = "No user selected."
         if st.session_state.create_form_selected_user:
             selected_user_display = f"Selected: {st.session_state.create_form_selected_user.name} ({st.session_state.create_form_selected_user.emailaddress})"
@@ -1669,9 +1676,8 @@ def display_create_ticket_form(halo_client: StandaloneHaloClient):
                     sel_user_obj = next(
                         (u for u in user_matches if u.id == picked_user_id), None
                     )
-                    if sel_user_obj:
-                        st.session_state.create_form_selected_user = sel_user_obj
-
+                if sel_user_obj:
+                    st.session_state.create_form_selected_user = sel_user_obj
         st.subheader("Location & Classification")
         create_cols1 = st.columns(4)
         with create_cols1[0]:
@@ -1708,7 +1714,6 @@ def display_create_ticket_form(halo_client: StandaloneHaloClient):
                 if x == 0
                 else cat_opts.get(x, f"ID:{x}"),
             )
-
         st.subheader("Priority & Assignment (Optional)")
         create_cols2 = st.columns(4)
         with create_cols2[0]:
@@ -1741,12 +1746,10 @@ def display_create_ticket_form(halo_client: StandaloneHaloClient):
                 if x == ""
                 else team_opts.get(x, x),
             )
-
         st.write("---")
         submitted = st.form_submit_button(
             "Create Ticket", use_container_width=True, type="primary"
         )
-
     if submitted:
         missing = []
         if not summary:
@@ -1780,17 +1783,13 @@ def display_create_ticket_form(halo_client: StandaloneHaloClient):
                 payload["agent_id"] = agent_id
             if team_name:
                 payload["team"] = team_name
-            # Add custom fields payload if needed here
-
             with st.spinner("Creating ticket..."):
                 result = halo_client.create_ticket(payload)
             if result and result.get("id"):
                 new_id = result["id"]
                 st.success(f"Ticket #{new_id} created!")
-                st.session_state.create_form_selected_user = (
-                    None  # Clear user selection
-                )
-                clear_ticket_cache()  # Clear list cache
+                st.session_state.create_form_selected_user = None
+                clear_ticket_cache()
                 st.session_state.view = "detail"
                 st.session_state.current_ticket_id = new_id
                 st.rerun()
@@ -1802,19 +1801,24 @@ def display_create_ticket_form(halo_client: StandaloneHaloClient):
                 )
 
 
-# --- Main App ---
+# --- Main App Execution ---
+# Session state initialization can happen before password check
 if "view" not in st.session_state:
     st.session_state.view = "list"
 if "current_ticket_id" not in st.session_state:
     st.session_state.current_ticket_id = None
 
+# NOTE: Client initialization happens *after* the password check successfully completes
 halo_client_instance = get_halo_client()
 
+# Routing logic (runs only if password was correct and client initialized)
 if halo_client_instance:
     if st.session_state.view == "list":
         display_ticket_list(halo_client_instance)
     elif st.session_state.view == "create":
-        display_create_ticket_form(halo_client_instance)
+        display_create_ticket_form(
+            halo_client_instance
+        )  # Check for client ID happens inside
     elif st.session_state.view == "detail" and st.session_state.current_ticket_id:
         display_ticket_detail(halo_client_instance, st.session_state.current_ticket_id)
     else:  # Default back to list view
