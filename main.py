@@ -1109,7 +1109,13 @@ def clear_ticket_cache(ticket_id: Optional[int] = None) -> None:
 def get_status_name(halo_client: StandaloneHaloClient, status_id: Optional[int]) -> str:
     if status_id is None:
         return "N/A"
-        statuses = get_statuses(halo_client)
+    # Fetch statuses using the cached function *inside* this helper
+    statuses = get_statuses(halo_client)  # Uses the @st.cache_resource function
+    # Handle case where fetching statuses failed
+    if not statuses:
+        log.warning("get_status_name: Failed to retrieve statuses from cache/API.")
+        return f"Err (ID:{status_id})"
+    # Find the status name or return the ID if not found
     return next((s.name for s in statuses if s.id == status_id), f"ID:{status_id}")
 
 
@@ -1118,7 +1124,13 @@ def get_category_name(
 ) -> str:
     if category_id is None:
         return "N/A"
-        categories = get_categories(halo_client)
+    # Fetch categories using the cached function *inside* this helper
+    categories = get_categories(halo_client)  # Uses the @st.cache_resource function
+    # Handle case where fetching categories failed
+    if not categories:
+        log.warning("get_category_name: Failed to retrieve categories from cache/API.")
+        return f"Err (ID:{category_id})"
+    # Find the category name or return the ID if not found
     return next(
         (c.category_name for c in categories if c.id == category_id),
         f"ID:{category_id}",
