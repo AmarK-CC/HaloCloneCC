@@ -1,0 +1,30 @@
+# Python general
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+*.venv/
+
+# IDE / OS specific
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+.history/ # Add this for VS Code history folder
+
+# Secrets / Config files (NEVER commit these)
+.env
+config.json
+*.log
+
+# Other files in your project to ignore
+gettest.py # Assuming this is a test script you don't want to deploy
+
+# Distribution / Build artifacts (if you ran pyinstaller)
+dist/
+build/
+*.spec
+
